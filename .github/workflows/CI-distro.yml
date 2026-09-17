@@ -295,6 +295,94 @@ jobs:
           call "%SIREUM_HOME%\bin\build.cmd" native distro --win --pack --vscodium || goto :error
           copy C:\Windows\System32\vcruntime140.dll Sireum\bin\win\ || goto :error
           copy C:\Windows\System32\vcruntime140_1.dll Sireum\bin\win\ || goto :error
+          goto :EOF
+          :error
+          exit /b %errorlevel%
+
+      # ---------------------------------------------------------------------------------------
+      # Authenticode signing.
+      #
+      # SELF-SIGNED, AND THEREFORE NOT A FIX FOR SMART APP CONTROL. A self-signed certificate
+      # does not chain to a trusted root, so Windows reports the signature as NotTrusted rather
+      # than Valid and SAC still blocks the binary. The point of these steps is to exercise the
+      # real pipeline -- signtool invocation, SHA-256 digests, RFC-3161 timestamping, and which
+      # artifacts get signed -- so that adopting a real certificate (SignPath Foundation's OSS
+      # program, or Azure Artifact Signing) changes only how the certificate is obtained.
+      #
+      # RSA rather than ECC is deliberate: Microsoft's SAC guidance requires RSA, so the
+      # placeholder matches the constraints of the certificate that would replace it.
+      # ---------------------------------------------------------------------------------------
+      - name: Create self-signed code-signing certificate
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=Sireum (self-signed placeholder - not a trusted publisher)" `
+            -KeyAlgorithm RSA -KeyLength 3072 `
+            -HashAlgorithm SHA256 `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -NotAfter (Get-Date).AddYears(1)
+          Write-Host "Created certificate $($cert.Thumbprint)"
+          "SIREUM_SIGN_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Sign Windows executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # signtool ships with the Windows SDK; the exact version directory moves between
+          # runner images, so resolve the newest rather than pinning a path.
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found in the Windows SDK" }
+          Write-Host "Using $($signtool.FullName)"
+
+          # Sireum's own native binary. The vcruntime DLLs are already Microsoft-signed and the
+          # IVE/CodeIVE archives are third-party (JetBrains, VSCodium) and carry their vendors'
+          # signatures -- re-signing either would be wrong, so neither is touched here.
+          $targets = @("$env:GITHUB_WORKSPACE\Sireum\bin\win\sireum.exe")
+
+          foreach ($t in $targets) {
+            if (-not (Test-Path $t)) { throw "expected to sign $t but it does not exist" }
+            & $signtool.FullName sign /v /fd SHA256 /td SHA256 `
+              /tr http://timestamp.digicert.com `
+              /sha1 $env:SIREUM_SIGN_THUMBPRINT $t
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed on $t with $LASTEXITCODE" }
+          }
+
+          foreach ($t in $targets) {
+            $sig = Get-AuthenticodeSignature $t
+            Write-Host "$t -> Status=$($sig.Status) Signer=$($sig.SignerCertificate.Subject)"
+            if ($sig.SignerCertificate -eq $null) { throw "no signature present on $t" }
+          }
+          Write-Host "NOTE: Status is expected to be NotTrusted/UnknownError -- the signing"
+          Write-Host "      certificate is self-signed and chains to no trusted root."
+
+      - name: Probe whether 7zz.com can carry an Authenticode signature
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # 7zz.com is an Actually Portable Executable -- a polyglot whose PE headers are embedded
+          # rather than leading. Whether signtool can sign one without corrupting it is unknown,
+          # and it matters because 7zz.com ships in the CLI archive alongside sireum.exe. Probe a
+          # COPY so a corrupting signature can never reach the artifact, and report the outcome.
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          $src = "$env:GITHUB_WORKSPACE\Sireum\bin\7zz.com"
+          $probe = "$env:RUNNER_TEMP\7zz-signprobe.com"
+          Copy-Item $src $probe -Force
+          & $signtool.FullName sign /v /fd SHA256 /sha1 $env:SIREUM_SIGN_THUMBPRINT $probe
+          Write-Host "signtool exit code: $LASTEXITCODE"
+          if ($LASTEXITCODE -eq 0) {
+            & $probe i > $null 2>&1
+            Write-Host "signed APE still executes: $($LASTEXITCODE -eq 0)"
+          }
+          Write-Host "Probe only -- the shipped 7zz.com is untouched either way."
+
+      - name: Package
+        shell: cmd
+        run: |
+          set SIREUM_HOME=%GITHUB_WORKSPACE%\Sireum
+          set errorlevel=
           "%SIREUM_HOME%\bin\7zz.com" a sireum-cli-win-amd64.7z Sireum\bin\sireum.bat Sireum\bin\slang-run.bat Sireum\bin\install Sireum\bin\7zz.com Sireum\bin\.7zz.ver Sireum\bin\win\sireum.exe Sireum\bin\win\vcruntime140.dll Sireum\bin\win\vcruntime140_1.dll Sireum\license.txt Sireum\readme.md Sireum\versions.properties || goto :error
           move "%SIREUM_HOME%\distro\win.7z" "%GITHUB_WORKSPACE%\sireum-ive-win-amd64.7z" || goto :error
           move "%SIREUM_HOME%\distro\sireum-codeive-win-amd64.7z" "%GITHUB_WORKSPACE%\" || goto :error
